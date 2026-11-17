@@ -6,7 +6,7 @@ covers the J.O.O.N.A.S. cleaning robots.
 | Mod | What it does | Status |
 |---|---|---|
 | [Smart Splitters](src/SmartSplitters) | Splitters skip full outputs instead of stalling; chained splitters split evenly (3/4/5-way…); per-splitter modes Smart / Overflow / Sort / Vanilla (F6/F7) | Tested in single-player |
-| [Joonas Overdrive](src/JoonasOverdrive) | Upgrade in the Cleaning tree: 4 levels, +25/50/100/150 % J.O.O.N.A.S. cleaning, travel and turn speed | In testing |
+| [Joonas Overdrive](src/JoonasOverdrive) | Upgrade in the Cleaning tree: 4 levels, +25/50/100/150 % J.O.O.N.A.S. cleaning, travel and turn speed | Tested in single-player (v0.2) |
 | [Baby Joonas](src/BabyJoonas) | Small helper robots that clean the inner rings of their parent's sector ([design](src/BabyJoonas/DESIGN.md)) | Prototype, off by default |
 | [Dev Menu Unlock](src/DevMenuUnlock) | Shows the game's hidden Dev tab in the pause menu settings (time of day, time speed, …) | Tested |
 | [Robot Logger](src/RobotLogger) | Read-only: once a second logs every cleaning robot's state to `BepInEx/RobotLog.csv` | Diagnostic |

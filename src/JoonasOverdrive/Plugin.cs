@@ -17,12 +17,12 @@ namespace MoonSweepers.JoonasOverdrive;
 // Joonas Overdrive: a purchasable upgrade (Cleaning branch of the upgrade terminal) that makes J.O.O.N.A.S.
 // robots drive, clean and turn faster. The owned level is stored by the game itself under the node id
 // (read back with MoonWorld.TreeLevel), the same way other modded upgrades persist.
-[BepInPlugin("moonsweepers.joonasoverdrive", "Joonas Overdrive", "0.1.0")]
+[BepInPlugin("moonsweepers.joonasoverdrive", "Joonas Overdrive", "0.2.0")]
 public class Plugin : BasePlugin
 {
     internal static ManualLogSource L;
     internal static ConfigEntry<string> Bonuses, Prices, Title, Summary, RobotName;
-    internal static ConfigEntry<bool> Acceleration;
+    internal static ConfigEntry<bool> Acceleration, ScaleScrub;
 
     public override void Load()
     {
@@ -33,6 +33,7 @@ public class Plugin : BasePlugin
         Summary = Config.Bind("Upgrade", "Summary", "J.O.O.N.A.S. drives, cleans and turns faster.", "Description in the upgrade terminal.");
         RobotName = Config.Bind("Advanced", "RobotName", "J.O.O.N.A.S.", "Robot docks with this display name get the bonus.");
         Acceleration = Config.Bind("Advanced", "ScaleAcceleration", true, "Also scale acceleration, so the robot reaches its faster speeds on short passes.");
+        ScaleScrub = Config.Bind("Advanced", "ScaleScrubMotion", true, "Also speed up the scrub animation that moves J.O.O.N.A.S. while it cleans (its cleaning pace is set by this, not by cleaning speed).");
         ClassInjector.RegisterTypeInIl2Cpp<OverdriveBehaviour>();
         AddComponent<OverdriveBehaviour>();
         L.LogInfo("Joonas Overdrive loaded.");
@@ -85,6 +86,32 @@ public class OverdriveBehaviour : MonoBehaviour
 
     float Factor(int lv) => 1f + (lv > 0 ? bonuses[Math.Min(lv, bonuses.Count) - 1] : 0f) / 100f;
 
+    // The motion is a shared asset that lives for the whole game session (also across world reloads),
+    // so its stock values are remembered once and never cleared.
+    readonly Dictionary<IntPtr, (float fps, float[] speed)> motionStock = new();
+    readonly Dictionary<IntPtr, float> motionFactor = new();
+
+    void Scrub(MoonJoonasMotion m, float f)
+    {
+        if (m == null) return;
+        var key = m.Pointer;
+        if (!motionStock.TryGetValue(key, out var s))
+        {
+            var sp = m.speed;
+            var copy = new float[sp?.Length ?? 0];
+            for (int i = 0; i < copy.Length; i++) copy[i] = sp[i];
+            motionStock[key] = s = (m.fps, copy);
+            motionFactor[key] = 1f;
+            Plugin.L.LogInfo($"Scrub motion '{m.name}': {s.fps:0.##} fps, {copy.Length} frames, base speed {(copy.Length > 0 ? copy.Average() : 0f):0.###} m/s.");
+        }
+        if (Math.Abs(motionFactor[key] - f) < 1e-4f) return;
+        m.fps = s.fps * f;
+        var arr = m.speed;
+        if (arr != null) for (int i = 0; i < arr.Length && i < s.speed.Length; i++) arr[i] = s.speed[i] * f;
+        motionFactor[key] = f;
+        Plugin.L.LogInfo($"Scrub motion '{m.name}' x{f:0.##}: {m.fps:0.##} fps, average speed {(s.speed.Length > 0 ? s.speed.Average() * f : 0f):0.###} m/s.");
+    }
+
     void Track()
     {
         if (world == null || world.WasCollected || !world.isActiveAndEnabled)
@@ -123,6 +150,9 @@ public class OverdriveBehaviour : MonoBehaviour
                 if (Math.Abs(r.travelSpeed - travel) > 1e-4f) r.travelSpeed = travel;
                 if (Math.Abs(r.turnRate - turn) > 1e-4f) r.turnRate = turn;
                 if (Math.Abs(r.acceleration - accel) > 1e-4f) r.acceleration = accel;
+                // While cleaning, J.O.O.N.A.S. moves by its scrub animation (MoonJoonasMotion: fps + per-frame speed),
+                // not by cleaningSpeed. Scale both so the pads stay in step with the body.
+                if (Plugin.ScaleScrub.Value) Scrub(r.launcher?.motion, f);
                 applied++;
             }
             catch (Exception e) { Plugin.L.LogWarning("Could not update a robot: " + e.Message); }
