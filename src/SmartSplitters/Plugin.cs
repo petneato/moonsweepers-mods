@@ -1,0 +1,535 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using BepInEx;
+using BepInEx.Configuration;
+using BepInEx.Logging;
+using BepInEx.Unity.IL2CPP;
+using HarmonyLib;
+using Il2CppInterop.Runtime.Injection;
+using MoonCleaners;
+using UnityEngine;
+
+namespace MoonSweepers.SmartSplitters;
+
+// Smart Splitters
+// ---------------
+// The stock splitter alternates strictly between its two outputs and waits when the output whose turn it is
+// is full. This mod picks the output for every capsule as it enters a splitter:
+//   Smart     - skip a full output; splitters chained output->input share capsules evenly over all final outputs
+//               (2 chained splitters = 3-way, 3 = 4-way, 4 = 5-way ...)
+//   Overflow  - always the main output, the other one only when the main one is backed up
+//   Sort X    - cargo X to the main output, everything else to the other output
+//   Vanilla   - the game's own behaviour
+// It steers by setting the splitter's own turn counter just before the game moves the capsule in, so no game
+// logic is replaced. Splitters stay normal splitters in the save; removing the mod restores vanilla behaviour.
+[BepInPlugin("moonsweepers.smartsplitters", "Smart Splitters", "1.0.0")]
+public class Plugin : BasePlugin
+{
+    internal static ManualLogSource L;
+    internal static ConfigEntry<UnityEngine.InputSystem.Key> ModeKey, SideKey;
+    internal static ConfigEntry<Mode> DefaultMode;
+    internal static ConfigEntry<int> SplitterKind;
+    internal static ConfigEntry<bool> ShowLabel;
+
+    public override void Load()
+    {
+        L = Log;
+        ModeKey = Config.Bind("Keys", "CycleMode", UnityEngine.InputSystem.Key.F6, "Look at a splitter and press to cycle its mode.");
+        SideKey = Config.Bind("Keys", "SwapMainSide", UnityEngine.InputSystem.Key.F7, "Look at a splitter and press to swap which side is the main output (Overflow / Sort modes).");
+        DefaultMode = Config.Bind("General", "DefaultMode", Mode.Smart, "Mode for splitters you haven't set yourself.");
+        ShowLabel = Config.Bind("General", "ShowLabel", true, "Show a label with the mode when you look at a splitter.");
+        SplitterKind = Config.Bind("Advanced", "SplitterKind", 11, "Structure kind number of the splitter (11 in Moon Sweepers 1.0.6).");
+        Core.LoadSettings();
+        try
+        {
+            new Harmony("moonsweepers.smartsplitters").PatchAll(typeof(Hooks));
+            ClassInjector.RegisterTypeInIl2Cpp<SplitterBehaviour>();
+            AddComponent<SplitterBehaviour>();
+            L.LogInfo($"Smart Splitters loaded. Look at a splitter: {ModeKey.Value} = mode, {SideKey.Value} = swap main side. Default mode: {DefaultMode.Value}.");
+        }
+        catch (Exception e) { L.LogError("Smart Splitters failed to start: " + e); }
+    }
+}
+
+public enum Mode { Smart, Overflow, SortDust, SortSand, SortStone, Vanilla }
+
+internal sealed class Splitter
+{
+    public int Id;
+    public Vector3 Pos, Entrance;
+    public readonly Vector3[] Out = new Vector3[3];
+    public readonly int[] Lane = new int[3], Route = new int[3], OutBelt = new int[3], Child = { -1, -1, -1 }, Leaves = { 0, 1, 1 };
+    public int InputBelt, LeftIndex = 1, Parent = -1;
+    public bool Partial;                             // known machine, but no lanes yet (nothing has passed since loading)
+    public readonly double[] Credit = new double[3];
+    public string Key => $"{Id}@{Pos.x:F1},{Pos.z:F1}";
+    public int Total => Leaves[1] + Leaves[2];
+}
+
+internal sealed class Setting { public Mode Mode { get; set; } public bool Swap { get; set; } }
+
+internal static class Core
+{
+    internal static MoonWorld World;
+    internal static IntPtr WorldPtr;
+    internal static int MainThread = -1;
+    internal static bool Ready;                      // topology valid and settled
+    internal static Dictionary<int, Splitter> Splitters = new();
+    internal static Dictionary<int, Splitter> ByInputBelt = new();
+
+    // Pending decision between HandOff prefix and postfix (main thread only).
+    internal static Splitter PendingSplitter; internal static int PendingId, PendingOut, PendingT0; internal static bool PendingForced;
+
+    // Self-check. Phase 0: watch untouched splitters to learn how the turn counter maps to the lane the game picks.
+    // Phase 1: steer, and on capsules sent against what the game would have done, confirm they really go there.
+    // Phase 2: confirmed. Phase 3: control doesn't work -> vanilla behaviour for the session.
+    internal static int Phase;
+    internal static bool TurnMeansNext = true;
+    internal static bool SteeringOff => Phase == 3;
+    static int learnSame, learnDiff, forcedGood, forcedBad;
+
+    internal static int Predict(int t0) => t0 == 1 || t0 == 2 ? (TurnMeansNext ? t0 : 3 - t0) : 0;
+
+    internal static void Learn(int t0, int actual)
+    {
+        if (actual == t0) learnSame++; else learnDiff++;
+        if (learnSame + learnDiff < 12) return;
+        if (learnSame >= 11) TurnMeansNext = true;
+        else if (learnDiff >= 11) TurnMeansNext = false;
+        else
+        {
+            Phase = 3;
+            Plugin.L.LogWarning($"Splitter turn counter doesn't predict the lane ({learnSame} same / {learnDiff} other). Splitters stay vanilla this session.");
+            return;
+        }
+        Phase = 1;
+        Plugin.L.LogInfo($"Learned splitter turn counter ({(TurnMeansNext ? "value = next output" : "value = last output")}); now verifying control.");
+    }
+
+    internal static void Verify(bool ok)
+    {
+        if (ok) forcedGood++; else forcedBad++;
+        if (forcedGood + forcedBad < 12) return;
+        if (forcedGood >= 11) { Phase = 2; Plugin.L.LogInfo($"Splitter control confirmed: {forcedGood}/{forcedGood + forcedBad} capsules sent against the game's choice went where intended."); }
+        else { Phase = 3; Plugin.L.LogWarning($"Splitter control failed ({forcedGood} right / {forcedBad} wrong when overriding the game). Splitters stay vanilla this session."); }
+    }
+
+    static Dictionary<string, Setting> settings = new();
+    static string SettingsPath => Path.Combine(Paths.ConfigPath, "SmartSplitters", "settings.json");
+
+    internal static Setting SettingOf(Splitter s) =>
+        settings.TryGetValue(s.Key, out var v) ? v : new Setting { Mode = Plugin.DefaultMode.Value };
+
+    internal static void Set(Splitter s, Setting v) { settings[s.Key] = v; SaveSettings(); }
+
+    internal static void LoadSettings()
+    {
+        try { if (File.Exists(SettingsPath)) settings = JsonSerializer.Deserialize<Dictionary<string, Setting>>(File.ReadAllText(SettingsPath)) ?? new(); }
+        catch (Exception e) { Plugin.L.LogWarning("Could not read splitter settings, starting fresh: " + e.Message); settings = new(); }
+    }
+
+    static void SaveSettings()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath));
+            var tmp = SettingsPath + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
+            File.Move(tmp, SettingsPath, true);
+        }
+        catch (Exception e) { Plugin.L.LogWarning("Could not save splitter settings: " + e.Message); }
+    }
+
+    internal static int MainIndex(Splitter s, Setting v) => v.Swap ? 3 - s.LeftIndex : s.LeftIndex;
+
+    static bool Full(MoonWorld w, Splitter s, int k) => w.RouteFull(s.Route[k]);
+
+    internal static int Cargo(MoonWorld w, int id)
+    {
+        var c = w.canisters;
+        if (c == null || !c.ContainsKey(id)) return -1;
+        return (int)c.get_Item(id).cargo;
+    }
+
+    // Choose output 1 or 2 for capsule `id` entering splitter `s`; 0 = leave it to the game.
+    internal static int Decide(MoonWorld w, Splitter s, int id, Setting v)
+    {
+        int main = MainIndex(s, v), other = 3 - main;
+        switch (v.Mode)
+        {
+            case Mode.Smart:
+            {
+                bool f1 = Full(w, s, 1), f2 = Full(w, s, 2);
+                if (f1 && f2) return 0;
+                if (f1) return 2;
+                if (f2) return 1;
+                double a = s.Credit[1] + s.Leaves[1], b = s.Credit[2] + s.Leaves[2];
+                return a >= b ? 1 : 2;
+            }
+            case Mode.Overflow:
+                if (!Full(w, s, main)) return main;
+                if (!Full(w, s, other)) return other;
+                return 0;
+            case Mode.SortDust: case Mode.SortSand: case Mode.SortStone:
+            {
+                int want = v.Mode == Mode.SortDust ? 0 : v.Mode == Mode.SortSand ? 1 : 2;
+                int c = Cargo(w, id);
+                if (c < 0) return 0;
+                return c == want ? main : other;
+            }
+        }
+        return 0;
+    }
+
+    // Smooth weighted round robin: commit the output that actually received the capsule.
+    internal static void Commit(Splitter s, int k)
+    {
+        double t = s.Total;
+        s.Credit[1] += s.Leaves[1]; s.Credit[2] += s.Leaves[2]; s.Credit[k] -= t;
+        for (int i = 1; i <= 2; i++) s.Credit[i] = Math.Clamp(s.Credit[i], -2 * t, 2 * t);
+    }
+
+    // ---------------- topology ----------------
+    struct BeltEnds { public int Key; public Vector3 Start, End; }
+
+    // Builds a fresh layout and swaps it in, so refreshing never interrupts steering.
+    internal static bool Rebuild(MoonWorld w)
+    {
+        var depots = w.depots; var riders = w.riders;
+        if (depots == null || riders == null || riders.lanes == null) return false;
+        var old = Splitters;
+        var Splitters_ = new Dictionary<int, Splitter>(); var byIn = new Dictionary<int, Splitter>();
+        var lanes = riders.lanes;
+        int kind = Plugin.SplitterKind.Value;
+
+        var belts = new List<BeltEnds>();
+        foreach (var kv in lanes)
+        {
+            if (kv.Key <= 0) continue;
+            var q = kv.Value; var p = q?.path; if (p == null) continue;
+            belts.Add(new BeltEnds { Key = kv.Key, Start = p.start, End = p.end });
+        }
+
+        foreach (var kv in depots)
+        {
+            var d = kv.Value; if (d == null || d.kind != kind) continue;
+            var s = new Splitter { Id = d.id, Pos = new Vector3(d.x, d.y, d.z) };
+            if (old.TryGetValue(s.Id, out var prev)) Array.Copy(prev.Credit, s.Credit, 3);
+            bool ok = true;
+            for (int k = 1; k <= 2; k++)
+            {
+                int r = MoonWorld.MachineRoute(s.Id, 0, k);
+                int key = lanes.ContainsKey(-r) ? -r : lanes.ContainsKey(r) ? r : 0;
+                var path = key != 0 ? lanes.get_Item(key)?.path : null;
+                if (path == null) { ok = false; break; }
+                s.Route[k] = r; s.Lane[k] = key; s.Out[k] = path.end;
+                if (k == 1) s.Entrance = path.start;
+            }
+            Splitters_[s.Id] = s;
+            if (!ok) { s.Partial = true; continue; }
+            s.InputBelt = Nearest(belts, s.Entrance, true);
+            for (int k = 1; k <= 2; k++) s.OutBelt[k] = Nearest(belts, s.Out[k], false);
+            Vector3 f = (s.Out[1] + s.Out[2]) * 0.5f - s.Entrance, v1 = s.Out[1] - s.Entrance;
+            s.LeftIndex = f.x * v1.z - f.z * v1.x > 0 ? 1 : 2;
+            if (s.InputBelt != 0) byIn[s.InputBelt] = s;
+        }
+
+        // Chains: follow each output over plain belt joints until the next machine; a splitter there is a child.
+        foreach (var s in Splitters_.Values)
+            for (int k = 1; k <= 2 && !s.Partial; k++)
+            {
+                int b = s.OutBelt[k];
+                for (int hop = 0; b != 0 && hop < 40; hop++)
+                {
+                    var end = Ends(belts, b).End;
+                    Splitter child = null;
+                    foreach (var t in Splitters_.Values) if (t != s && !t.Partial && (t.Entrance - end).magnitude < 0.75f) { child = t; break; }
+                    if (child != null) { s.Child[k] = child.Id; if (child.Parent < 0) child.Parent = s.Id; break; }
+                    int next = 0;
+                    foreach (var e in belts) if (e.Key != b && (e.Start - end).magnitude < 0.3f) { next = e.Key; break; }
+                    b = next;
+                }
+            }
+        Splitters = Splitters_;
+        foreach (var s in Splitters_.Values) if (!s.Partial) Count(s, 0);
+        ByInputBelt = byIn;
+
+        int partial = 0; foreach (var s in Splitters_.Values) if (s.Partial) partial++;
+        var sb = new StringBuilder($"Found {Splitters_.Count} splitters ({partial} idle since loading)");
+        foreach (var s in Splitters_.Values)
+            if (s.Parent < 0 && (s.Child[1] >= 0 || s.Child[2] >= 0)) sb.Append($"; #{s.Id} heads a {s.Total}-way chain");
+        var text = sb.ToString();
+        if (text != lastLayout) { lastLayout = text; Plugin.L.LogInfo(text); }
+        return true;
+    }
+
+    static string lastLayout;
+    internal static readonly Dictionary<int, int[]> Sent = new();
+
+    internal static void Note(Splitter s, int k)
+    {
+        if (!Sent.TryGetValue(s.Id, out var c)) Sent[s.Id] = c = new int[3];
+        c[k]++;
+    }
+
+    internal static void Report()
+    {
+        if (Sent.Count == 0) return;
+        var sb = new StringBuilder("Last minute, capsules per splitter (left/right):");
+        foreach (var kv in Sent)
+            if (Splitters.TryGetValue(kv.Key, out var s))
+            {
+                int l = kv.Value[s.LeftIndex], r = kv.Value[3 - s.LeftIndex];
+                sb.Append($" #{s.Id} {SettingOf(s).Mode} {l}/{r};");
+            }
+        Plugin.L.LogInfo(sb.ToString());
+        Sent.Clear();
+    }
+
+    static int Count(Splitter s, int depth)
+    {
+        for (int k = 1; k <= 2; k++)
+            s.Leaves[k] = s.Child[k] >= 0 && depth < 8 && Splitters.TryGetValue(s.Child[k], out var c) ? Count(c, depth + 1) : 1;
+        return s.Leaves[1] + s.Leaves[2];
+    }
+
+    static int Nearest(List<BeltEnds> belts, Vector3 p, bool byEnd)
+    {
+        int best = 0; float bd = 0.75f;
+        foreach (var e in belts) { float d = ((byEnd ? e.End : e.Start) - p).magnitude; if (d < bd) { bd = d; best = e.Key; } }
+        return best;
+    }
+
+    static BeltEnds Ends(List<BeltEnds> belts, int key) { foreach (var e in belts) if (e.Key == key) return e; return default; }
+
+    internal static string Describe(Splitter s)
+    {
+        var v = SettingOf(s);
+        string side = MainIndex(s, v) == s.LeftIndex ? "left" : "right";
+        string text = v.Mode switch
+        {
+            Mode.Smart when s.Parent >= 0 && Splitters.TryGetValue(s.Parent, out var p) && SettingOf(p).Mode == Mode.Smart
+                => $"Smart · part of the chain headed by splitter #{Root(s).Id}",
+            Mode.Smart when s.Total > 2 => $"Smart · {s.Total}-way chain, {100.0 / s.Total:F0}% to each output, skips full ones",
+            Mode.Smart => "Smart · 50/50, skips a full output",
+            Mode.Overflow => $"Overflow · everything {side}, the other side only when {side} is backed up",
+            Mode.SortDust => $"Sort · dust {side}, everything else the other way",
+            Mode.SortSand => $"Sort · sand {side}, everything else the other way",
+            Mode.SortStone => $"Sort · stone {side}, everything else the other way",
+            _ => "Vanilla · strict alternation (game default)",
+        };
+        if (SteeringOff) text += "  [inactive: control check failed, see log]";
+        else if (!Ready) text += "  [waiting for building to settle]";
+        else if (s.Partial) text += "  [idle: applies once capsules come through]";
+        else if (Phase < 2) text += "  [self-check running]";
+        return $"Splitter #{s.Id} · {text}";
+    }
+
+    static Splitter Root(Splitter s)
+    {
+        for (int i = 0; i < 10 && s.Parent >= 0 && Splitters.TryGetValue(s.Parent, out var p); i++) s = p;
+        return s;
+    }
+}
+
+[HarmonyPatch]
+internal static class Hooks
+{
+    // MoonWorld.HandOff(belt, path, id): the capsule at the end of `belt` moves on. For a splitter's input belt this
+    // is where the game picks the splitter lane using machineTurns, so we set the turn just before it reads it.
+    [HarmonyPatch(typeof(MoonWorld), nameof(MoonWorld.HandOff))]
+    [HarmonyPrefix]
+    static void Before(MoonWorld __instance, int belt, int id)
+    {
+        try
+        {
+            Core.PendingSplitter = null;
+            if (belt <= 0 || !Core.Ready || Core.SteeringOff) return;
+            if (Environment.CurrentManagedThreadId != Core.MainThread) return;
+            if (__instance.Pointer != Core.WorldPtr) return;
+            if (!Core.ByInputBelt.TryGetValue(belt, out var s)) return;
+            var turns = __instance.machineTurns;
+            if (turns == null) return;
+            int t0 = turns.ContainsKey(s.Id) ? turns.get_Item(s.Id) : 0;
+            if (Core.Phase == 0)
+            {
+                // Learning: don't touch anything, just remember the counter to compare with where the capsule goes.
+                if (t0 != 1 && t0 != 2) return;
+                Core.PendingSplitter = s; Core.PendingId = id; Core.PendingOut = 0; Core.PendingT0 = t0; Core.PendingForced = false;
+                return;
+            }
+            var v = Core.SettingOf(s);
+            if (v.Mode == Mode.Vanilla) return;
+            int d = Core.Decide(__instance, s, id, v);
+            if (d == 0) return;
+            int pred = Core.Predict(t0);
+            // While verifying, deliberately go against the game's own choice when that costs nothing (Smart, both sides free).
+            if (Core.Phase == 1 && v.Mode == Mode.Smart && pred != 0 && d == pred && !__instance.RouteFull(s.Route[3 - d])) d = 3 - d;
+            turns.set_Item(s.Id, Core.TurnMeansNext ? d : 3 - d);
+            Core.PendingSplitter = s; Core.PendingId = id; Core.PendingOut = d; Core.PendingT0 = t0; Core.PendingForced = pred != 0 && d != pred;
+        }
+        catch (Exception e) { Core.PendingSplitter = null; Plugin.L.LogError("Splitter decision failed: " + e.Message); }
+    }
+
+    [HarmonyPatch(typeof(MoonWorld), nameof(MoonWorld.HandOff))]
+    [HarmonyPostfix]
+    static void After(MoonWorld __instance, int id, bool __result)
+    {
+        var s = Core.PendingSplitter;
+        if (s == null || Core.PendingId != id) return;
+        Core.PendingSplitter = null;
+        if (!__result) return;
+        try
+        {
+            var all = __instance.riders?.all;
+            if (all == null || !all.ContainsKey(id)) return;
+            int lane = all.get_Item(id).belt;
+            int actual = lane == s.Lane[1] ? 1 : lane == s.Lane[2] ? 2 : 0;
+            if (actual == 0) return;
+            if (Core.PendingOut == 0) { if (Core.Phase == 0) Core.Learn(Core.PendingT0, actual); return; }
+            Core.Commit(s, actual);
+            Core.Note(s, actual);
+            if (Core.Phase == 1 && Core.PendingForced) Core.Verify(actual == Core.PendingOut);
+        }
+        catch (Exception e) { Plugin.L.LogError("Splitter bookkeeping failed: " + e.Message); }
+    }
+}
+
+public class SplitterBehaviour : MonoBehaviour
+{
+    public SplitterBehaviour(IntPtr ptr) : base(ptr) { }
+
+    float nextScan, dirtySince = -1, toastUntil, nextAim, nextReport = 60f;
+    int signature;
+    string toast;
+    Splitter aimed;
+    GUIStyle style;
+
+    void Update()
+    {
+        Core.MainThread = Environment.CurrentManagedThreadId;
+        float now = Time.unscaledTime;
+        try
+        {
+            if (now >= nextScan) { nextScan = now + 0.5f; Scan(now); }
+            if (now >= nextReport) { nextReport = now + 60f; Core.Report(); }
+            if (now >= nextAim) { nextAim = now + 0.1f; aimed = Aimed(); }
+            // The game uses Unity's Input System; the legacy Input API never sees key presses here.
+            var kb = UnityEngine.InputSystem.Keyboard.current;
+            if (kb != null)
+            {
+                if (kb.get_Item(Plugin.ModeKey.Value).wasPressedThisFrame) Cycle(now);
+                if (kb.get_Item(Plugin.SideKey.Value).wasPressedThisFrame) Swap(now);
+            }
+            if (!guiSeen && now > 30f && !guiWarned) { guiWarned = true; Plugin.L.LogWarning("On-screen label has not been drawn yet (OnGUI not called)."); }
+        }
+        catch (Exception e) { Plugin.L.LogError("Smart Splitters update: " + e.Message); }
+    }
+
+    void Scan(float now)
+    {
+        var w = Core.World;
+        if (w == null || w.Pointer == IntPtr.Zero || !w.isActiveAndEnabled) w = UnityEngine.Object.FindFirstObjectByType<MoonWorld>();
+        if (w == null) { Core.Ready = false; Core.World = null; Core.WorldPtr = IntPtr.Zero; return; }
+        if (w.Pointer != Core.WorldPtr) { Core.World = w; Core.WorldPtr = w.Pointer; Core.Ready = false; dirtySince = now; signature = 0; }
+        var lanes = w.riders?.lanes; var depots = w.depots; var conveyors = w.conveyors;
+        if (lanes == null || depots == null || conveyors == null) { Core.Ready = false; return; }
+        // Lanes come and go as belts fill and empty, so only machines and belts count as "something was built".
+        int sig = depots.Count * 100003 + conveyors.Count;
+        if (sig != signature) { signature = sig; dirtySince = now; Core.Ready = false; return; }
+        // Something was built or removed: wait until it has been quiet for 1.5 s before trusting the layout again.
+        if (!Core.Ready && dirtySince >= 0 && now - dirtySince > 1.5f) { if (Core.Rebuild(w)) Core.Ready = true; dirtySince = -1; nextRefresh = now + 5f; }
+        // Splitters only get lanes once capsules pass through after loading: keep picking them up.
+        else if (Core.Ready && now >= nextRefresh) { nextRefresh = now + 5f; Core.Rebuild(w); }
+    }
+
+    float nextRefresh;
+
+    static Camera Cam()
+    {
+        var cam = Camera.main;
+        if (cam != null && cam.isActiveAndEnabled) return cam;
+        cam = Camera.current;
+        if (cam != null) return cam;
+        foreach (var c in Camera.allCameras) if (c != null && c.isActiveAndEnabled) return c;
+        return null;
+    }
+
+    // Saved machine positions may be in the world object's local space rather than Unity world space; try both.
+    static Vector3 WorldPos(Splitter s, bool local) =>
+        local && Core.World != null ? Core.World.transform.TransformPoint(s.Pos) : s.Pos;
+
+    Splitter Aimed() => Aimed(out _);
+
+    Splitter Aimed(out string why)
+    {
+        why = null;
+        var cam = Cam(); if (cam == null) { why = "no camera"; return null; }
+        if (Core.Splitters.Count == 0) { why = "no splitters known yet"; return null; }
+        Vector3 o = cam.transform.position, f = cam.transform.forward;
+        Splitter best = null, near = null; float bd = 2.5f, nd = 6f, closest = float.MaxValue;
+        foreach (bool local in new[] { false, true })
+            foreach (var s in Core.Splitters.Values)
+            {
+                Vector3 d = WorldPos(s, local) - o; float t = Vector3.Dot(d, f);
+                closest = Math.Min(closest, d.magnitude);
+                if (d.magnitude < nd) { nd = d.magnitude; near = s; }      // fallback: standing right next to one
+                if (t < 0.3f || t > 12f) continue;
+                float perp = (d - f * t).magnitude;
+                if (perp < bd) { bd = perp; best = s; }
+            }
+        if (best == null && near == null) why = $"camera '{cam.name}' at {o}, nearest splitter {closest:F1} m away";
+        return best ?? near;
+    }
+
+    void Miss(string what, float now)
+    {
+        Aimed(out var why);
+        Toast($"Look at a splitter (or stand next to one) to {what}.", now);
+        if (why != null) Plugin.L.LogInfo("  (aim check: " + why + ")");
+    }
+
+    void Cycle(float now)
+    {
+        if (aimed == null) { Miss("change its mode", now); return; }
+        var v = Core.SettingOf(aimed);
+        v.Mode = (Mode)(((int)v.Mode + 1) % 6);
+        Core.Set(aimed, v);
+        Toast(Core.Describe(aimed), now);
+    }
+
+    void Swap(float now)
+    {
+        if (aimed == null) { Miss("swap its main side", now); return; }
+        var v = Core.SettingOf(aimed);
+        v.Swap = !v.Swap;
+        Core.Set(aimed, v);
+        Toast(Core.Describe(aimed), now);
+    }
+
+    void Toast(string text, float now) { toast = text; toastUntil = now + 4f; Plugin.L.LogInfo(text); }
+
+    bool guiSeen, guiWarned, aimLogged;
+
+    void OnGUI()
+    {
+        if (!guiSeen) { guiSeen = true; Plugin.L.LogInfo("On-screen label ready."); }
+        if (aimed != null && !aimLogged) { aimLogged = true; Plugin.L.LogInfo($"Looking at splitter #{aimed.Id} - label shown."); }
+        try
+        {
+            if (style == null)
+            {
+                style = new GUIStyle(GUI.skin.box) { fontSize = 18, alignment = TextAnchor.MiddleCenter, wordWrap = true };
+                style.normal.textColor = Color.white;
+            }
+            string text = Time.unscaledTime < toastUntil ? toast : (Plugin.ShowLabel.Value && aimed != null ? Core.Describe(aimed) + $"   [{Plugin.ModeKey.Value}: mode  {Plugin.SideKey.Value}: swap side]" : null);
+            if (string.IsNullOrEmpty(text)) return;
+            float w = Math.Min(900, Screen.width - 40);
+            GUI.Box(new Rect((Screen.width - w) / 2, Screen.height * 0.12f, w, 44), text, style);
+        }
+        catch { }
+    }
+}
