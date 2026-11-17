@@ -23,5 +23,10 @@
     <Reference Include="$(GameDir)\BepInEx\interop\UnityEngine.InputLegacyModule.dll" Private="false" />
     <Reference Include="$(GameDir)\BepInEx\interop\UnityEngine.TextRenderingModule.dll" Private="false" />
     <Reference Include="$(GameDir)\BepInEx\interop\Unity.InputSystem.dll" Private="false" />
+    <Reference Include="$(GameDir)\BepInEx\interop\UnityEngine.UIModule.dll" Private="false" />
+    <Reference Include="$(GameDir)\BepInEx\interop\UnityEngine.UI.dll" Private="false" />
+    <Reference Include="$(GameDir)\BepInEx\interop\Unity.TextMeshPro.dll" Private="false" />
+    <Reference Include="$(GameDir)\BepInEx\interop\UnityEngine.TextCoreFontEngineModule.dll" Private="false" />
+    <Reference Include="$(GameDir)\BepInEx\interop\UnityEngine.TextCoreTextEngineModule.dll" Private="false" />
   </ItemGroup>
 </Project>

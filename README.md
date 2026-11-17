@@ -62,7 +62,7 @@ No game files or generated interop assemblies are included in this repository; t
 
 ## Status
 
-Splitter steering (Smart mode, chains up to 6-way) tested in single-player on 1.0.6. The mode keys and on-screen label were just switched to the game's Input System and still need an in-game check. Co-op is untested (the host's splitters decide; guests probably need the mod too for consistent results).
+Tested in single-player on 1.0.6: splitter steering (Smart mode, chains up to 6-way), mode keys and the on-screen label. Co-op is untested (the host's splitters decide; guests probably need the mod too for consistent results).
 
 ## License
 

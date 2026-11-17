@@ -406,7 +406,6 @@ public class SplitterBehaviour : MonoBehaviour
     int signature;
     string toast;
     Splitter aimed;
-    GUIStyle style;
 
     void Update()
     {
@@ -424,7 +423,7 @@ public class SplitterBehaviour : MonoBehaviour
                 if (kb.get_Item(Plugin.ModeKey.Value).wasPressedThisFrame) Cycle(now);
                 if (kb.get_Item(Plugin.SideKey.Value).wasPressedThisFrame) Swap(now);
             }
-            if (!guiSeen && now > 30f && !guiWarned) { guiWarned = true; Plugin.L.LogWarning("On-screen label has not been drawn yet (OnGUI not called)."); }
+            UpdateHud();
         }
         catch (Exception e) { Plugin.L.LogError("Smart Splitters update: " + e.Message); }
     }
@@ -512,24 +511,91 @@ public class SplitterBehaviour : MonoBehaviour
 
     void Toast(string text, float now) { toast = text; toastUntil = now + 4f; Plugin.L.LogInfo(text); }
 
-    bool guiSeen, guiWarned, aimLogged;
+    bool guiSeen, guiWarned, aimLogged, hudFailed;
 
-    void OnGUI()
+    // ---- on-screen label, drawn with the game's own UI system (uGUI + TextMeshPro) ----
+    GameObject hud, panel;
+    TMPro.TextMeshProUGUI label;
+    string shown;
+
+    void UpdateHud()
     {
-        if (!guiSeen) { guiSeen = true; Plugin.L.LogInfo("On-screen label ready."); }
+        string text = Time.unscaledTime < toastUntil ? toast
+            : (Plugin.ShowLabel.Value && aimed != null && Core.World != null
+                ? Core.Describe(aimed) + $"\n<size=75%>{Plugin.ModeKey.Value}: change mode    {Plugin.SideKey.Value}: swap main side</size>" : null);
+        if (string.IsNullOrEmpty(text)) { if (panel != null && panel.activeSelf) panel.SetActive(false); return; }
+        if (!EnsureHud()) return;
+        if (text != shown) { label.text = text; shown = text; }
+        if (!panel.activeSelf) panel.SetActive(true);
+        if (!guiSeen) { guiSeen = true; Plugin.L.LogInfo("On-screen label created."); }
         if (aimed != null && !aimLogged) { aimLogged = true; Plugin.L.LogInfo($"Looking at splitter #{aimed.Id} - label shown."); }
+    }
+
+    bool EnsureHud()
+    {
+        if (label != null && panel != null) return true;
+        if (hudFailed) return false;
         try
         {
-            if (style == null)
-            {
-                style = new GUIStyle(GUI.skin.box) { fontSize = 18, alignment = TextAnchor.MiddleCenter, wordWrap = true };
-                style.normal.textColor = Color.white;
-            }
-            string text = Time.unscaledTime < toastUntil ? toast : (Plugin.ShowLabel.Value && aimed != null ? Core.Describe(aimed) + $"   [{Plugin.ModeKey.Value}: mode  {Plugin.SideKey.Value}: swap side]" : null);
-            if (string.IsNullOrEmpty(text)) return;
-            float w = Math.Min(900, Screen.width - 40);
-            GUI.Box(new Rect((Screen.width - w) / 2, Screen.height * 0.12f, w, 44), text, style);
+            hud = new GameObject("SmartSplittersHUD");
+            UnityEngine.Object.DontDestroyOnLoad(hud);
+            var canvas = hud.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+            canvas.sortingOrder = 30000;
+            var scaler = hud.AddComponent<UnityEngine.UI.CanvasScaler>();
+            scaler.uiScaleMode = UnityEngine.UI.CanvasScaler.ScaleMode.ScaleWithScreenSize;
+            scaler.referenceResolution = new Vector2(1920, 1080);
+            scaler.matchWidthOrHeight = 0.5f;
+
+            panel = new GameObject("Panel");
+            panel.transform.SetParent(hud.transform, false);
+            var bg = panel.AddComponent<UnityEngine.UI.Image>();
+            bg.color = new Color(0f, 0f, 0f, 0.6f);
+            bg.raycastTarget = false;
+            var prt = panel.GetComponent<RectTransform>();
+            prt.anchorMin = prt.anchorMax = new Vector2(0.5f, 1f);
+            prt.pivot = new Vector2(0.5f, 1f);
+            prt.anchoredPosition = new Vector2(0f, -110f);
+            prt.sizeDelta = new Vector2(1150f, 78f);
+
+            var tgo = new GameObject("Text");
+            tgo.transform.SetParent(panel.transform, false);
+            label = tgo.AddComponent<TMPro.TextMeshProUGUI>();
+            var font = FindFont();
+            if (font != null) label.font = font;
+            label.fontSize = 24;
+            label.color = Color.white;
+            label.alignment = TMPro.TextAlignmentOptions.Center;
+            label.raycastTarget = false;
+            var trt = tgo.GetComponent<RectTransform>();
+            trt.anchorMin = Vector2.zero; trt.anchorMax = Vector2.one;
+            trt.offsetMin = new Vector2(16f, 6f); trt.offsetMax = new Vector2(-16f, -6f);
+            panel.SetActive(false);
+            Plugin.L.LogInfo($"On-screen label set up (font: {(font != null ? font.name : "TextMeshPro default")}).");
+            return true;
+        }
+        catch (Exception e)
+        {
+            hudFailed = true;
+            Plugin.L.LogError("Could not create the on-screen label: " + e);
+            return false;
+        }
+    }
+
+    static TMPro.TMP_FontAsset FindFont()
+    {
+        try
+        {
+            var any = UnityEngine.Object.FindFirstObjectByType<TMPro.TMP_Text>();
+            if (any != null && any.font != null) return any.font;
         }
         catch { }
+        try
+        {
+            var all = Resources.FindObjectsOfTypeAll<TMPro.TMP_FontAsset>();
+            if (all != null && all.Length > 0) return all[0];
+        }
+        catch { }
+        return TMPro.TMP_Settings.defaultFontAsset;
     }
 }
