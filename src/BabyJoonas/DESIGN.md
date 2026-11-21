@@ -1,5 +1,16 @@
 # Baby J.O.O.N.A.S. — design
 
+> **Status (1.6.0).** This is the design note written before the first build, kept for reference. Some details below
+> are out of date: "off by default", "not installed", and the files section. What shipped:
+> - Babies come from an upgrade with tiers 1–3.
+> - They sweep the sector's inner disc in arcs, rather than taking the game's inner lanes.
+> - Once baby cleaning is confirmed, the parent's inner lanes are removed from its plan, never its current pass.
+> - Idle babies take over the parent's last remaining lanes, and later the dirt it leaves in finished sectors (1.6).
+> - Babies skip ground that is already clean, using the game's `RemainingAt`.
+> - They hold back while the cleaning queue is busy.
+>
+> Measured costs and the queue limits are in `docs/GAME-INTERNALS.md`.
+
 Upgrade idea: every J.O.O.N.A.S. gets small helper robots ("babies") that clean the inner rings of the
 sector their parent is working on, while the parent cleans the outer ring. Babies stay with their parent.
 
