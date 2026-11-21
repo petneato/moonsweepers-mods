@@ -25,7 +25,7 @@ namespace MoonSweepers.SmartSplitters;
 //   Vanilla   - the game's own behaviour
 // It steers by setting the splitter's own turn counter just before the game moves the capsule in, so no game
 // logic is replaced. Splitters stay normal splitters in the save; removing the mod restores vanilla behaviour.
-[BepInPlugin("moonsweepers.smartsplitters", "Smart Splitters", "1.0.0")]
+[BepInPlugin("moonsweepers.smartsplitters", "Smart Splitters", "1.2.0")]
 public class Plugin : BasePlugin
 {
     internal static ManualLogSource L;
@@ -83,38 +83,60 @@ internal static class Core
     // Pending decision between HandOff prefix and postfix (main thread only).
     internal static Splitter PendingSplitter; internal static int PendingId, PendingOut, PendingT0; internal static bool PendingForced;
 
-    // Self-check. Phase 0: watch untouched splitters to learn how the turn counter maps to the lane the game picks.
-    // Phase 1: steer, and on capsules sent against what the game would have done, confirm they really go there.
-    // Phase 2: confirmed. Phase 3: control doesn't work -> vanilla behaviour for the session.
-    internal static int Phase;
-    internal static bool TurnMeansNext = true;
+    // Self-check.
+    // Each splitter learns on its own which way its turn counter works: we set it for the output we want, look where
+    // the capsule really went, and flip that splitter's mapping after two misses in a row (only counted when the
+    // wanted lane had room, so the game had no reason to divert). Globally, Phase 1 verifies that overriding the
+    // game's own choice works at least 85% of the time; Phase 2 = confirmed (still monitored); Phase 3 = off.
+    internal static int Phase = 1;
     internal static bool SteeringOff => Phase == 3;
-    static int learnSame, learnDiff, forcedGood, forcedBad;
+    internal static readonly Dictionary<int, (bool next, int miss, int uses)> Mapping = new();
+    static int forcedGood, forcedBad, winGood, winBad;
 
-    internal static int Predict(int t0) => t0 == 1 || t0 == 2 ? (TurnMeansNext ? t0 : 3 - t0) : 0;
+    internal static bool Next(int id) => !Mapping.TryGetValue(id, out var m) || m.next;
 
-    internal static void Learn(int t0, int actual)
+    internal static int Predict(int id, int t0) => t0 == 1 || t0 == 2 ? (Next(id) ? t0 : 3 - t0) : 0;
+
+    // Returns true if this sample counts (splitter past its warm-up).
+    internal static bool Observe(int id, bool ok)
     {
-        if (actual == t0) learnSame++; else learnDiff++;
-        if (learnSame + learnDiff < 12) return;
-        if (learnSame >= 11) TurnMeansNext = true;
-        else if (learnDiff >= 11) TurnMeansNext = false;
-        else
+        Mapping.TryGetValue(id, out var m);
+        if (!Mapping.ContainsKey(id)) m = (true, 0, 0);
+        m.uses++;
+        if (ok) m.miss = 0;
+        else if (++m.miss >= 2) { m.next = !m.next; m.miss = 0; }
+        Mapping[id] = m;
+        return m.uses > 4;
+    }
+
+    internal static int MissesThisMinute, MissWantedBusy, MissOtherBusy, MissWarmup; static int missLogged;
+    internal static void Miss(Splitter s, int wanted, int actual, int t0, bool forced, bool wantedBusy, bool otherBusy, int uses)
+    {
+        MissesThisMinute++; if (wantedBusy) MissWantedBusy++; if (otherBusy) MissOtherBusy++; if (uses <= 4) MissWarmup++;
+        if (missLogged < 15)
         {
-            Phase = 3;
-            Plugin.L.LogWarning($"Splitter turn counter doesn't predict the lane ({learnSame} same / {learnDiff} other). Splitters stay vanilla this session.");
-            return;
+            missLogged++;
+            Plugin.L.LogInfo($"[miss] splitter #{s.Id} ({Phase switch { 1 => "self-check", 2 => "confirmed", _ => "off" }}): wanted {(wanted == 1 ? "left" : "right")}, went {(actual == 1 ? "left" : "right")}; turn before {t0}, mapping {(Next(s.Id) ? "next" : "flipped")}, use #{uses}, forced {forced}; after hand-off wanted lane {(wantedBusy ? "busy" : "free")}, other lane {(otherBusy ? "busy" : "free")}.");
         }
-        Phase = 1;
-        Plugin.L.LogInfo($"Learned splitter turn counter ({(TurnMeansNext ? "value = next output" : "value = last output")}); now verifying control.");
     }
 
     internal static void Verify(bool ok)
     {
-        if (ok) forcedGood++; else forcedBad++;
-        if (forcedGood + forcedBad < 12) return;
-        if (forcedGood >= 11) { Phase = 2; Plugin.L.LogInfo($"Splitter control confirmed: {forcedGood}/{forcedGood + forcedBad} capsules sent against the game's choice went where intended."); }
-        else { Phase = 3; Plugin.L.LogWarning($"Splitter control failed ({forcedGood} right / {forcedBad} wrong when overriding the game). Splitters stay vanilla this session."); }
+        if (Phase == 1)
+        {
+            if (ok) forcedGood++; else forcedBad++;
+            if (forcedGood + forcedBad < 40) return;
+            // If overriding didn't work at all, forced capsules would follow the game's own choice (~0% right); random
+            // would be 50%. 65% or better means control works and the misses are the game diverting (timing).
+            if (forcedGood >= 26) { Phase = 2; Plugin.L.LogInfo($"Splitter control confirmed: {forcedGood}/{forcedGood + forcedBad} capsules sent against the game's choice went where intended."); }
+            else { Phase = 3; Plugin.L.LogWarning($"Splitter control failed ({forcedGood} right / {forcedBad} wrong when overriding the game). Splitters stay vanilla this session."); }
+            return;
+        }
+        if (Phase != 2) return;
+        if (ok) winGood++; else winBad++;
+        if (winGood + winBad < 200) return;
+        if (winBad > 80) { Phase = 3; Plugin.L.LogWarning($"Splitter control degraded ({winBad} of 200 recent capsules went the wrong way). Splitters stay vanilla for the rest of this session."); }
+        winGood = winBad = 0;
     }
 
     static Dictionary<string, Setting> settings = new();
@@ -278,6 +300,8 @@ internal static class Core
     internal static void Report()
     {
         if (Sent.Count == 0) return;
+        if (MissesThisMinute > 0) Plugin.L.LogInfo($"Last minute, {MissesThisMinute} capsules went the other way than chosen ({MissWantedBusy} with the chosen lane busy right after, {MissOtherBusy} with the other lane busy, {MissWarmup} during a splitter's first uses).");
+        MissesThisMinute = MissWantedBusy = MissOtherBusy = MissWarmup = 0;
         var sb = new StringBuilder("Last minute, capsules per splitter (left/right):");
         foreach (var kv in Sent)
             if (Splitters.TryGetValue(kv.Key, out var s))
@@ -342,36 +366,32 @@ internal static class Hooks
     // is where the game picks the splitter lane using machineTurns, so we set the turn just before it reads it.
     [HarmonyPatch(typeof(MoonWorld), nameof(MoonWorld.HandOff))]
     [HarmonyPrefix]
-    static void Before(MoonWorld __instance, int belt, int id)
+    static bool Before(MoonWorld __instance, int belt, int id, ref bool __result)
     {
         try
         {
             Core.PendingSplitter = null;
-            if (belt <= 0 || !Core.Ready || Core.SteeringOff) return;
-            if (Environment.CurrentManagedThreadId != Core.MainThread) return;
-            if (__instance.Pointer != Core.WorldPtr) return;
-            if (!Core.ByInputBelt.TryGetValue(belt, out var s)) return;
+            if (belt <= 0 || !Core.Ready || Core.SteeringOff) return true;
+            if (Environment.CurrentManagedThreadId != Core.MainThread) return true;
+            if (__instance.Pointer != Core.WorldPtr) return true;
+            if (!Core.ByInputBelt.TryGetValue(belt, out var s)) return true;
             var turns = __instance.machineTurns;
-            if (turns == null) return;
-            int t0 = turns.ContainsKey(s.Id) ? turns.get_Item(s.Id) : 0;
-            if (Core.Phase == 0)
-            {
-                // Learning: don't touch anything, just remember the counter to compare with where the capsule goes.
-                if (t0 != 1 && t0 != 2) return;
-                Core.PendingSplitter = s; Core.PendingId = id; Core.PendingOut = 0; Core.PendingT0 = t0; Core.PendingForced = false;
-                return;
-            }
+            if (turns == null) return true;
             var v = Core.SettingOf(s);
-            if (v.Mode == Mode.Vanilla) return;
+            if (v.Mode == Mode.Vanilla) return true;
             int d = Core.Decide(__instance, s, id, v);
-            if (d == 0) return;
-            int pred = Core.Predict(t0);
+            if (d == 0) return true;
+            bool sort = v.Mode == Mode.SortDust || v.Mode == Mode.SortSand || v.Mode == Mode.SortStone;
+            if (sort && __instance.RouteFull(s.Route[d])) { __result = false; return false; }   // wait rather than risk the wrong side
+            int t0 = turns.ContainsKey(s.Id) ? turns.get_Item(s.Id) : 0;
+            int pred = Core.Predict(s.Id, t0);
             // While verifying, deliberately go against the game's own choice when that costs nothing (Smart, both sides free).
             if (Core.Phase == 1 && v.Mode == Mode.Smart && pred != 0 && d == pred && !__instance.RouteFull(s.Route[3 - d])) d = 3 - d;
-            turns.set_Item(s.Id, Core.TurnMeansNext ? d : 3 - d);
+            turns.set_Item(s.Id, Core.Next(s.Id) ? d : 3 - d);
             Core.PendingSplitter = s; Core.PendingId = id; Core.PendingOut = d; Core.PendingT0 = t0; Core.PendingForced = pred != 0 && d != pred;
         }
         catch (Exception e) { Core.PendingSplitter = null; Plugin.L.LogError("Splitter decision failed: " + e.Message); }
+        return true;
     }
 
     [HarmonyPatch(typeof(MoonWorld), nameof(MoonWorld.HandOff))]
@@ -389,10 +409,18 @@ internal static class Hooks
             int lane = all.get_Item(id).belt;
             int actual = lane == s.Lane[1] ? 1 : lane == s.Lane[2] ? 2 : 0;
             if (actual == 0) return;
-            if (Core.PendingOut == 0) { if (Core.Phase == 0) Core.Learn(Core.PendingT0, actual); return; }
+            bool ok = actual == Core.PendingOut;
+            if (!ok)
+            {
+                bool wb = false, ob = false; int uses = 0;
+                try { wb = __instance.RouteFull(s.Route[Core.PendingOut]); ob = __instance.RouteFull(s.Route[3 - Core.PendingOut]); } catch { }
+                if (Core.Mapping.TryGetValue(s.Id, out var mm)) uses = mm.uses + 1;
+                Core.Miss(s, Core.PendingOut, actual, Core.PendingT0, Core.PendingForced, wb, ob, uses);
+            }
+            bool counts = Core.Observe(s.Id, ok);
             Core.Commit(s, actual);
             Core.Note(s, actual);
-            if (Core.Phase == 1 && Core.PendingForced) Core.Verify(actual == Core.PendingOut);
+            if (counts && (Core.Phase == 2 || Core.PendingForced)) Core.Verify(ok);
         }
         catch (Exception e) { Plugin.L.LogError("Splitter bookkeeping failed: " + e.Message); }
     }
