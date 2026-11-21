@@ -13,7 +13,7 @@ namespace MoonSweepers.RobotLogger;
 
 // Read-only diagnostic: once a second, records what every cleaning robot (J.O.O.N.A.S., Mk I, Mk II) is doing.
 // No game code is hooked or changed. Output: BepInEx\RobotLog.csv. Stops by itself after RunMinutes.
-[BepInPlugin("moonsweepers.robotlogger", "Robot Logger", "0.1.0")]
+[BepInPlugin("moonsweepers.robotlogger", "Robot Logger", "0.2.1")]
 public class Plugin : BasePlugin
 {
     internal static ManualLogSource L;
@@ -42,9 +42,13 @@ public class RobotLoggerBehaviour : MonoBehaviour
     int rows;
     static readonly CultureInfo C = CultureInfo.InvariantCulture;
 
+    float fps = 60f;
+
     void Update()
     {
         if (done) return;
+        float udt = Time.unscaledDeltaTime;
+        if (udt > 0) fps = fps * 0.95f + (1f / udt) * 0.05f;
         float now = Time.unscaledTime;
         if (now < next) return;
         next = now + Math.Max(0.2f, Plugin.Interval.Value);
@@ -55,6 +59,9 @@ public class RobotLoggerBehaviour : MonoBehaviour
             if (w == null) Open(now);
             if (now - started > Plugin.RunMinutes.Value * 60f) { Finish("time limit reached"); return; }
             float t = now - started;
+            MoonRobotVacuum first = null;
+            for (int i = 0; i < docks.Count && first == null; i++) { try { first = docks.get_Item(i)?.Robot; } catch { } }
+            World(t, first);
             for (int i = 0; i < docks.Count; i++)
             {
                 MoonRobotDock d = null;
@@ -79,7 +86,7 @@ public class RobotLoggerBehaviour : MonoBehaviour
     {
         var path = Path.Combine(Paths.BepInExRootPath, "RobotLog.csv");
         w = new StreamWriter(path, false);
-        w.WriteLine("t,kind,dock,name,state,stateTime,status,x,y,z,speed,carriedKg,capacityKg,dockStoredKg,dockFull,hexesDone,leftInDoneHexes,recoveries,cell,mapCell,round,laneIndex,rows,lanes,hexDirtyStart,hexDirtyNow,finishing,stuckInHex,waitingAs,waitReason,dockStatus,beltStatus");
+        w.WriteLine("t,kind,dock,name,state,stateTime,status,x,y,z,speed,carriedKg,capacityKg,dockStoredKg,dockFull,hexesDone,leftInDoneHexes,recoveries,cell,mapCell,round,laneIndex,rows,lanes,hexDirtyStart,hexDirtyNow,finishing,stuckInHex,waitingAs,waitReason,dockStatus,beltStatus,strokesWaitingS,strokesBehind");
         started = now;
         Plugin.L.LogInfo("Robot Logger recording to " + path);
     }
@@ -89,6 +96,7 @@ public class RobotLoggerBehaviour : MonoBehaviour
         w.WriteLine($"{F(t)},params,{d.DockId},{Q(d.displayName)},rings={d.rings} roams={d.Roams} cleaningSpeed={F(r.cleaningSpeed)} travelSpeed={F(r.travelSpeed)} cleaningWidth={F(r.cleaningWidth)} laneOverrun={F(r.laneOverrun)} laneEdgeRun={F(r.laneEdgeRun)} capacityKg={F(r.capacityKilograms)} turnRate={F(r.turnRate)}");
         try
         {
+            w.WriteLine($"{F(t)},static,,,MaxRobotStrokesWaiting={MoonWorld.MaxRobotStrokesWaiting} MaxStrokesAFrame={MoonWorld.MaxStrokesAFrame} MaxQueuedStrokes={MoonWorld.MaxQueuedStrokes}");
             w.WriteLine($"{F(t)},static,,,LaneSpacing={F(MoonRobotVacuum.LaneSpacing)} MergeGap={F(MoonRobotVacuum.MergeGap)} MaxRounds={MoonRobotVacuum.MaxRounds} RevisitSeconds={F(MoonRobotVacuum.RevisitSeconds)} HexIdleSeconds={F(MoonRobotVacuum.HexIdleSeconds)} StuckLimit={MoonRobotVacuum.StuckLimit} StrokeInterval={F(MoonRobotVacuum.StrokeInterval)}");
         }
         catch (Exception e) { w.WriteLine($"{F(t)},static-error,,,{Q(e.Message)}"); }
@@ -107,8 +115,23 @@ public class RobotLoggerBehaviour : MonoBehaviour
             F(t), "robot", d.DockId, Q(d.displayName), r.state, F(r.stateTime), Q(r.StatusText),
             F(p.x), F(p.y), F(p.z), F(r.speed), F(r.DustKilograms), F(r.capacityKilograms), F(d.StoredKilograms), d.Full,
             r.HexesDone, r.LeftInDoneHexes, r.Recoveries, r.cell, r.mapCell, r.round, r.laneIndex, r.rows, lanes,
-            r.hexDirtyStart, r.hexDirtyNow, r.finishing, r.stuckInHex, r.waitingAs, Q(r.waitReason), Q(d.Status), Q(d.BeltStatus)));
+            r.hexDirtyStart, r.hexDirtyNow, r.finishing, r.stuckInHex, r.waitingAs, Q(r.waitReason), Q(d.Status), Q(d.BeltStatus),
+            F(Waiting(r)), Behind(r)));
         rows++;
+    }
+
+    // Cleaning backlog: robots pause while too many of their strokes wait to be processed (read-only calls).
+    static float Waiting(MoonRobotVacuum r) { try { var w = r.world; return w != null && r.storageId != null ? w.RobotStrokesWaitingSeconds(r.storageId) : -1f; } catch { return -1f; } }
+    static string Behind(MoonRobotVacuum r) { try { return r.StrokesBehind() ? "True" : "False"; } catch { return ""; } }
+
+    void World(float t, MoonRobotVacuum anyRobot)
+    {
+        try
+        {
+            var mw = anyRobot?.world; if (mw == null) return;
+            w.WriteLine($"{F(t)},world,,,fps={F(fps)} pendingToolStrokes={mw.PendingToolStrokes} strokeCount={mw.strokeCount}");
+        }
+        catch (Exception e) { w.WriteLine($"{F(t)},world-error,,,{Q(e.Message)}"); }
     }
 
     void Finish(string why)

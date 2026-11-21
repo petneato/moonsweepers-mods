@@ -17,7 +17,7 @@ namespace MoonSweepers.JoonasOverdrive;
 // Joonas Overdrive: a purchasable upgrade (Cleaning branch of the upgrade terminal) that makes J.O.O.N.A.S.
 // robots drive, clean and turn faster. The owned level is stored by the game itself under the node id
 // (read back with MoonWorld.TreeLevel), the same way other modded upgrades persist.
-[BepInPlugin("moonsweepers.joonasoverdrive", "Joonas Overdrive", "0.2.0")]
+[BepInPlugin("moonsweepers.joonasoverdrive", "Joonas Overdrive", "0.2.1")]
 public class Plugin : BasePlugin
 {
     internal static ManualLogSource L;
@@ -54,8 +54,8 @@ public class OverdriveBehaviour : MonoBehaviour
     struct Stock { public float Clean, Travel, Turn, Accel; }
 
     bool started, failed;
-    float next;
-    int level = -1;
+    float next, nextCountLog;
+    int level = -1, loggedCount = -1;
     List<float> bonuses = new();
     MoonWorld world;
     readonly Dictionary<IntPtr, Stock> stock = new();   // per robot: values before any bonus, so it never compounds
@@ -121,7 +121,7 @@ public class OverdriveBehaviour : MonoBehaviour
             if (world == null) return;
         }
         int lv = Math.Clamp(world.TreeLevel("", NodeId), 0, bonuses.Count);
-        bool changed = lv != level;
+        bool levelChanged = lv != level;
         level = lv;
         float f = Factor(lv);
 
@@ -143,7 +143,6 @@ public class OverdriveBehaviour : MonoBehaviour
                     if (haveSample && f > 1f && Math.Abs(s.Clean - sample.Clean * f) < 1e-3f) s = sample;
                     stock[r.Pointer] = s;
                     if (!haveSample) { sample = s; haveSample = true; }
-                    changed = true;
                 }
                 float clean = s.Clean * f, travel = s.Travel * f, turn = s.Turn * f, accel = Plugin.Acceleration.Value ? s.Accel * f : s.Accel;
                 if (Math.Abs(r.cleaningSpeed - clean) > 1e-4f) r.cleaningSpeed = clean;
@@ -157,8 +156,14 @@ public class OverdriveBehaviour : MonoBehaviour
             }
             catch (Exception e) { Plugin.L.LogWarning("Could not update a robot: " + e.Message); }
         }
-        if (changed && applied > 0 && haveSample)
+        // 0.2.1: placing robots logged one line each (254 lines in a long session); now the robot count is logged at
+        // most once a minute, the level at once.
+        float now = Time.unscaledTime;
+        if (applied > 0 && haveSample && (levelChanged || (applied != loggedCount && now >= nextCountLog)))
+        {
+            loggedCount = applied; nextCountLog = now + 60f;
             Plugin.L.LogInfo($"{Plugin.Title.Value} level {lv} (x{f:0.##}) on {applied} J.O.O.N.A.S.: cleaning {sample.Clean * f:0.##} m/s, travel {sample.Travel * f:0.##} m/s, turn {sample.Turn * f:0.#} deg/s, accel {(Plugin.Acceleration.Value ? sample.Accel * f : sample.Accel):0.##}.");
+        }
     }
 
     bool AddNode()
