@@ -16,6 +16,11 @@ native, so behaviour was inferred from member names, logging probes and save fil
   (e.g. `MoonUpgradeTree.Nodes`) are fine.
 - Harmony hooks on hot paths should check they run on the main thread and should not read objects that are being
   built or removed (an early probe crashed while a splitter was being placed).
+- Reading those constants through the interop getters is fine (they return the compiled value).
+- Il2CppInterop warns at start-up about injected `MonoBehaviour` methods whose parameter or return types it can't
+  map. Mark such methods `[HideFromIl2Cpp]`.
+- IL2CPP arrays (`Il2CppStructArray<T>`) can be read directly. The element data starts `4 * IntPtr.Size` bytes after
+  `.Pointer` (object header, bounds, length). This is much cheaper than the indexer when scanning thousands of entries.
 
 ## Conveyors and splitters
 
@@ -44,6 +49,48 @@ native, so behaviour was inferred from member names, logging probes and save fil
 - Measured with 18 robots over 9.4 min: 70 % cleaning, 21 % travel, 8 % aligning, ~0 % idle/stuck; ~86 s per sector,
   ~98 % of dirty cells cleaned, 11–22 kg/min per robot. Average speed while cleaning ~1.3 m/s (short passes, turning).
 - Robots clean through `MoonWorld.QueueToolStroke(...)`; see `src/BabyJoonas/DESIGN.md`.
+- Each J.O.O.N.A.S. cleans with 6 scrub pads. Each pad stroke is 0.92 m wide with 0.05 m soft edges and about 1 m long.
+  Stroke ids are `strokePlayer + k × 0x01010101` (k = 1–6).
+- **Sector maps.** `MoonRobotVacuum.map` (`MoonRobotDustMap`) covers only the sector being worked on: ~960 ground points,
+  1 m apart.
+  - Per point it holds `kind[]` (`Kind.Dusty` = ground that holds dust), `dirty[]` (above `DirtyThreshold` 0.03),
+    `inReach[]` vs `reachStamp`, and `passes[]`.
+  - The robot leaves a point alone after `PassesBeforeIgnoring` = 5 passes, for `IgnoreSeconds` = 240.
+  - When the sector is finished, `HexesDone` and `LeftInDoneHexes` go up, and `MapFor(nextCell)` replaces the map in
+    the same frame.
+  - The dirty points left in the map at that moment match the increase in `LeftInDoneHexes`: about 10 per sector. They
+    are dirt out of reach (next to structures) or given up on.
+  - So reading the map later only ever shows the current sector. Baby J.O.O.N.A.S. 1.6 reads the finished map in a
+    prefix on `MapFor`.
+
+## Cleaning queue (why many robots make the game slow)
+
+Measured with Cleaning Catch-Up's per-minute reports. The main session was 18 hours with 55, later ~110 J.O.O.N.A.S.
+
+- **Queueing.** `MoonWorld.QueueToolStroke` only queues a stroke. `MoonWorld.ProcessToolStrokes(complete, robotMs)`
+  applies queued strokes once a frame, through `MoonWorld.CleanToolStroke`.
+- **Budget.** Robot strokes get at most min(`settings.cleaningWorkBudgetMs` = 2 ms, roughly a fifth of the frame)
+  per frame.
+  - Focused at 130–180 fps, the fifth of the frame is the limit.
+  - At the 30 fps background cap, the 2 ms budget is the limit.
+  - `MoonWorld.MaxRobotStrokesWaiting` is 2048.
+- **Throttling.** When a robot's strokes have waited `StrokesBehindSeconds` (2.5 s), the game holds that robot until
+  the queue catches up.
+  - With 55 robots, the queue averaged 1,700 of 2,048 for hours.
+  - Cleaning used ~20 % of wall time in every minute, and robots were held in 35–55 % of samples.
+- **Cost is proportional to the area under the stroke,** soft edges included: about 0.09 ms per m² inside
+  `CleanToolStroke`.
+  - A J.O.O.N.A.S. pad stroke (~1.9 m²) costs 0.17–0.23 ms.
+  - A 2 m-wide baby stroke (2.4 m long, ~11 m² with its rounded ends) is applied as ~2.5 narrower pieces of
+    0.42–0.6 ms each, about 1–1.5 ms in all.
+  - Dust collected per millisecond was about the same for both.
+- **Clean ground.** 43–48 % of J.O.O.N.A.S. strokes landed on ground that was already clean while sectors were still
+  being worked. Once an area was done it was 90–100 %.
+  - The game processes these like any other stroke.
+  - Not queueing them is the largest saving available to a mod.
+  - Spot-checks put the dust that skipping costs at 0.2–0.7 % of the total.
+- **Single slow strokes.** Occasionally one stroke takes 25–60 ms (the slowest seen: 44.5 ms for one J.O.O.N.A.S. pad
+  stroke). The larger hitches (150–400 ms) are not in the cleaning code.
 
 ## Save files
 
